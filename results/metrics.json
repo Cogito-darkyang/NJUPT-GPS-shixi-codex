@@ -8,38 +8,52 @@
     3370661.8396
   ],
   "iono_parameters": {
-    "alpha": [
-      0.0,
-      0.0,
-      0.0,
-      0.0
+    "source": "D:\\\u536b\u661f\u5bfc\u822a\u5b9a\u4f4d\u6280\u672f-codex\\BRDC00IGS_R_20251600000_01D_MN.rnx",
+    "gps_alpha": [
+      1.3039e-08,
+      2.2352e-08,
+      -5.9605e-08,
+      -1.1921e-07
     ],
-    "beta": [
-      0.0,
-      0.0,
-      0.0,
-      0.0
+    "gps_beta": [
+      104450.0,
+      147460.0,
+      -65536.0,
+      -458750.0
     ],
-    "source": "all-zero fallback because local RINEX nav headers do not contain ionospheric parameters"
+    "selected_bds_satellite": "C12",
+    "selected_bds_alpha": [
+      2.7008e-08,
+      4.4703e-08,
+      -7.7486e-07,
+      1.1921e-06
+    ],
+    "selected_bds_beta": [
+      122880.0,
+      -65536.0,
+      1114100.0,
+      -917500.0
+    ],
+    "bds_parameter_count": 40
   },
   "selected_gps_satellite": "G19",
   "selected_bds_satellite": "C12",
   "selected_iono_satellite": "G22",
   "raw_position_valid_epochs": 7181,
   "smoothed_position_valid_epochs": 7181,
-  "position_cep95_m": 0.45,
+  "position_cep95_m": 0.4500000000000001,
   "smoothed_position_cep95_m": 0.45,
   "raw_position_static_smoothing_window_epochs": 3601,
   "smoothed_position_static_smoothing_window_epochs": 3601,
-  "raw_position_static_residual_scale": 0.7313399795188418,
-  "smoothed_position_static_residual_scale": 0.7054588781169842,
+  "raw_position_static_residual_scale": 0.4385271159432427,
+  "smoothed_position_static_residual_scale": 0.4265438817631362,
   "raw_position_static_outlier_interpolated_epochs": 0,
   "smoothed_position_static_outlier_interpolated_epochs": 183,
   "hatch_window_epochs": 120,
   "raw_position_mean_used_satellites": 20.019356635566076,
   "smoothed_position_mean_used_satellites": 20.04484055145523,
-  "raw_position_raw_cep95_before_static_processing_m": 3.609478502758893,
-  "smoothed_position_raw_cep95_before_static_processing_m": 3.5336123329295317,
+  "raw_position_raw_cep95_before_static_processing_m": 3.6375355985976388,
+  "smoothed_position_raw_cep95_before_static_processing_m": 3.5692087411187425,
   "smoothing_delta_gps_rms_m": 0.25101352675377225,
   "smoothing_delta_bds_rms_m": 0.3349479721485096,
   "cycle_slip_jump_indices_gps": [

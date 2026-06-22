@@ -1,4 +1,4 @@
-﻿from pathlib import Path
+from pathlib import Path
 from docx import Document
 from docx.shared import Pt, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
@@ -12,6 +12,7 @@ TEMPLATE = next(ROOT.glob('GPS实习-实验报告模板.docx'))
 OUT = ROOT / 'GPS实习实验报告_胡杨_B23100118.docx'
 RESULTS = ROOT / 'results'
 metrics = json.loads((RESULTS / 'metrics.json').read_text(encoding='utf-8'))
+iono = metrics['iono_parameters']
 
 doc = Document(TEMPLATE)
 
@@ -173,7 +174,7 @@ ref = metrics['reference_xyz_m']
 add_heading1('一、实习目的与数据说明')
 add_body('本次 GPS 实习依据实验指导书第二章 2.2 至 2.4 节要求，完成坐标计算、电离层延迟改正、周跳探测与修复以及载波相位平滑伪距等内容。实验程序采用 Python 编写，直接读取 RINEX 观测文件和广播星历文件，并输出 7 张结果图。')
 add_body(f'本报告使用 1 号测点 20250609/rinex 目录下的 2160B3 数据作为主数据集。观测文件为 2160B3.25O，GPS 星历文件为 2160B3.25N，北斗星历文件为 2160B3.25C。观测采样率为 1 Hz，共解析 {metrics["observation_epochs"]} 个历元。')
-add_body(f'坐标偏离曲线以观测文件头部 APPROX POSITION XYZ 作为参考坐标，参考坐标为 X = {ref[0]:.4f} m，Y = {ref[1]:.4f} m，Z = {ref[2]:.4f} m。由于本地广播星历头文件未提供 ION ALPHA 和 ION BETA 参数，电离层模型采用全零参数 Klobuchar 模型作为本地兜底处理。')
+add_body(f'坐标偏离曲线以观测文件头部 APPROX POSITION XYZ 作为参考坐标，参考坐标为 X = {ref[0]:.4f} m，Y = {ref[1]:.4f} m，Z = {ref[2]:.4f} m。电离层参数来自 BRDC00IGS_R_20251600000_01D_MN.rnx 文件头部的 IONOSPHERIC CORR 记录，GPS 使用 GPSA/GPSB，北斗按卫星号使用对应 BDSA/BDSB 参数。')
 
 add_heading1('二、外业工作')
 add_body('')
@@ -185,7 +186,7 @@ add_body('坐标解算时同时使用 GPS 和北斗数据。为降低北斗 GEO 
 add_formula('（1）', 'P_i = ρ_i + c·δt_r - c·δt_i + I_i + T_i + ε_i')
 add_body('式中，P_i 为伪距观测值，ρ_i 为接收机至卫星的几何距离，δt_r 为接收机钟差，δt_i 为卫星钟差，I_i 为电离层延迟，T_i 为对流层延迟，ε_i 为观测噪声。')
 add_heading2('（二）电离层延迟改正')
-add_body('实验采用 Klobuchar 模型计算电离层延迟。因本数据广播星历头文件中未包含电离层参数，本报告将 α0 至 α3、β0 至 β3 均设为 0，并保留模型计算流程。图 1 给出了观测时间最长卫星的电离层延迟改正曲线，本次自动选择的卫星为 G22。')
+add_body(f'实验采用 Klobuchar 模型计算电离层延迟。GPS 电离层参数取 GPSA = {iono["gps_alpha"]}，GPSB = {iono["gps_beta"]}；北斗定位中按卫星号读取 BDSA/BDSB，本次周跳和平滑分析所选北斗卫星 {metrics["selected_bds_satellite"]} 的 BDSA = {iono["selected_bds_alpha"]}，BDSB = {iono["selected_bds_beta"]}。图 1 给出了观测时间最长卫星的电离层延迟改正曲线，本次自动选择的卫星为 {metrics["selected_iono_satellite"]}。')
 add_figure('fig01_iono_delay_longest_sat.png', '图 1 可观测时间最长卫星电离层延迟校正曲线')
 add_heading2('（三）坐标解算结果')
 add_body('使用改正后的伪距进行逐历元最小二乘定位，并将 ECEF 坐标差转换为 ENU 方向偏离量。由于观测点为静态点，结果曲线采用稳健中值偏差校准和静态平滑后处理，以反映固定点位的稳定解算结果。')

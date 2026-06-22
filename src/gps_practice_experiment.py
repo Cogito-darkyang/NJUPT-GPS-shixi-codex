@@ -4,7 +4,7 @@ import argparse
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -31,6 +31,25 @@ LAMBDA_BDS_B1I = C_LIGHT / FREQ_BDS_B1I
 
 IONO_ALPHA_ZERO = (0.0, 0.0, 0.0, 0.0)
 IONO_BETA_ZERO = (0.0, 0.0, 0.0, 0.0)
+
+
+@dataclass
+class IonosphereParameters:
+    gps_alpha: Tuple[float, float, float, float] = IONO_ALPHA_ZERO
+    gps_beta: Tuple[float, float, float, float] = IONO_BETA_ZERO
+    bds_alpha_by_sv: Dict[str, Tuple[float, float, float, float]] = field(default_factory=dict)
+    bds_beta_by_sv: Dict[str, Tuple[float, float, float, float]] = field(default_factory=dict)
+    source: str = "all-zero fallback"
+
+    def alpha_beta(self, system: str, sv: str) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
+        if system == "G":
+            return self.gps_alpha, self.gps_beta
+        if system == "C":
+            alpha = self.bds_alpha_by_sv.get(sv)
+            beta = self.bds_beta_by_sv.get(sv)
+            if alpha is not None and beta is not None:
+                return alpha, beta
+        return IONO_ALPHA_ZERO, IONO_BETA_ZERO
 
 
 @dataclass
@@ -121,6 +140,12 @@ def parse_args() -> argparse.Namespace:
         default=10.0,
         help="Elevation mask in degrees for positioning.",
     )
+    parser.add_argument(
+        "--iono-file",
+        type=Path,
+        default=None,
+        help="Optional RINEX navigation file containing IONOSPHERIC CORR records. Defaults to BRDC00IGS_*_MN.rnx in the workspace when present.",
+    )
     return parser.parse_args()
 
 
@@ -147,6 +172,63 @@ def discover_rinex_dir(base: Path) -> Path:
 def rinex_float_values(text: str) -> List[float]:
     pattern = r"[+-]?\d+\.\d+(?:[DE][+-]?\d+)?|[+-]?\d+(?:[DE][+-]?\d+)"
     return [float(match.replace("D", "E")) for match in re.findall(pattern, text)]
+
+
+def discover_iono_file(base: Path) -> Optional[Path]:
+    candidates = sorted(base.glob("BRDC00IGS_R_*_MN.rnx"))
+    if candidates:
+        return candidates[0]
+    candidates = sorted(base.glob("*MN.rnx"))
+    return candidates[0] if candidates else None
+
+
+def parse_ionosphere_parameters(path: Optional[Path]) -> IonosphereParameters:
+    if path is None:
+        return IonosphereParameters(source="all-zero fallback: no IONOSPHERIC CORR file found")
+    if not path.exists():
+        raise FileNotFoundError(f"Ionospheric parameter file does not exist: {path}")
+
+    params = IonosphereParameters(source=str(path))
+    with path.open("r", encoding="ascii", errors="replace") as handle:
+        for line in handle:
+            if "END OF HEADER" in line:
+                break
+            if "IONOSPHERIC CORR" not in line:
+                continue
+            label = line[:4].strip().upper()
+            values = tuple(rinex_float_values(line)[:4])
+            if len(values) != 4:
+                continue
+            if label == "GPSA":
+                params.gps_alpha = values  # type: ignore[assignment]
+            elif label == "GPSB":
+                params.gps_beta = values  # type: ignore[assignment]
+            elif label in ("BDSA", "BDSB"):
+                parts = line.split()
+                if len(parts) < 7:
+                    continue
+                try:
+                    sv = f"C{int(parts[6]):02d}"
+                except ValueError:
+                    continue
+                if label == "BDSA":
+                    params.bds_alpha_by_sv[sv] = values  # type: ignore[assignment]
+                else:
+                    params.bds_beta_by_sv[sv] = values  # type: ignore[assignment]
+    return params
+
+
+def ionosphere_metrics(params: IonosphereParameters, selected_bds_sv: str) -> Dict[str, object]:
+    bds_alpha, bds_beta = params.alpha_beta("C", selected_bds_sv)
+    return {
+        "source": params.source,
+        "gps_alpha": list(params.gps_alpha),
+        "gps_beta": list(params.gps_beta),
+        "selected_bds_satellite": selected_bds_sv,
+        "selected_bds_alpha": list(bds_alpha),
+        "selected_bds_beta": list(bds_beta),
+        "bds_parameter_count": len(params.bds_alpha_by_sv),
+    }
 
 
 def gps_week_sow(dt: datetime) -> Tuple[int, float]:
@@ -557,6 +639,7 @@ def solve_epoch_position(
     reference_xyz: np.ndarray,
     use_smoothed: bool,
     elevation_mask_rad: float,
+    iono_params: IonosphereParameters,
 ) -> Tuple[Optional[np.ndarray], List[str], Optional[np.ndarray]]:
     x = np.array([1.0, 1.0, 1.0], dtype=float)
     gps_clock_m = 0.0
@@ -596,7 +679,8 @@ def solve_epoch_position(
             if np.linalg.norm(x) > 6.0e6 and elevation < elevation_mask_rad:
                 continue
 
-            iono = klobuchar_delay_m(angle_xyz, azimuth, elevation, epoch.gps_sow)
+            alpha, beta = iono_params.alpha_beta(obs.system, sv)
+            iono = klobuchar_delay_m(angle_xyz, azimuth, elevation, epoch.gps_sow, alpha, beta)
             tropo = troposphere_delay_m(angle_xyz, elevation)
             corrected_p = pseudorange - iono - tropo
 
@@ -678,7 +762,8 @@ def solve_epoch_position(
                 azimuth, elevation = az_el(angle_xyz, sat_xyz)
                 if elevation < elevation_mask_rad:
                     continue
-                iono = klobuchar_delay_m(angle_xyz, azimuth, elevation, epoch.gps_sow)
+                alpha, beta = iono_params.alpha_beta(obs.system, sv)
+                iono = klobuchar_delay_m(angle_xyz, azimuth, elevation, epoch.gps_sow, alpha, beta)
                 tropo = troposphere_delay_m(angle_xyz, elevation)
                 corrected_p = pseudorange - iono - tropo
                 geometric_range = np.linalg.norm(sat_xyz - x)
@@ -726,6 +811,7 @@ def solve_positions(
     reference_xyz: np.ndarray,
     use_smoothed: bool,
     elevation_mask_deg: float,
+    iono_params: IonosphereParameters,
 ) -> Dict[str, np.ndarray]:
     times: List[float] = []
     xyzs: List[np.ndarray] = []
@@ -741,6 +827,7 @@ def solve_positions(
             reference_xyz=reference_xyz,
             use_smoothed=use_smoothed,
             elevation_mask_rad=elevation_mask_rad,
+            iono_params=iono_params,
         )
         if xyz is None:
             continue
@@ -1001,6 +1088,7 @@ def compute_iono_curve(
     nav_bds: Dict[str, List[NavRecord]],
     receiver_xyz: np.ndarray,
     sv: str,
+    iono_params: IonosphereParameters,
 ) -> Tuple[np.ndarray, np.ndarray]:
     times: List[float] = []
     delays: List[float] = []
@@ -1022,7 +1110,8 @@ def compute_iono_curve(
         azimuth, elevation = az_el(receiver_xyz, sat_xyz)
         if elevation <= 0.0:
             continue
-        delay = klobuchar_delay_m(receiver_xyz, azimuth, elevation, epoch.gps_sow)
+        alpha, beta = iono_params.alpha_beta(sv[0], sv)
+        delay = klobuchar_delay_m(receiver_xyz, azimuth, elevation, epoch.gps_sow, alpha, beta)
         times.append(epoch.seconds_from_start)
         delays.append(delay)
     return np.asarray(times), np.asarray(delays)
@@ -1188,12 +1277,15 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
     nav_gps = parse_nav_file(gps_nav_path, "G")
     print(f"Reading BDS nav: {bds_nav_path}")
     nav_bds = parse_nav_file(bds_nav_path, "C")
+    iono_file = args.iono_file if args.iono_file is not None else discover_iono_file(Path.cwd())
+    iono_params = parse_ionosphere_parameters(iono_file)
+    print(f"Ionospheric parameters: {iono_params.source}")
 
     add_hatch_smoothed_pseudorange(epochs, args.hatch_window)
     gps_sv, bds_sv, iono_sv = choose_longest_satellites(epochs)
     print(f"Selected GPS {gps_sv}, BDS {bds_sv}, ionosphere satellite {iono_sv}.")
 
-    iono_time, iono_delay = compute_iono_curve(epochs, nav_gps, nav_bds, header.approx_xyz, iono_sv)
+    iono_time, iono_delay = compute_iono_curve(epochs, nav_gps, nav_bds, header.approx_xyz, iono_sv, iono_params)
     plot_iono(iono_time, iono_delay, iono_sv, results_dir / "fig01_iono_delay_longest_sat.png")
 
     raw_positions = solve_positions(
@@ -1203,6 +1295,7 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
         header.approx_xyz,
         use_smoothed=False,
         elevation_mask_deg=args.elevation_mask,
+        iono_params=iono_params,
     )
     raw_enu = to_enu_series(header.approx_xyz, raw_positions["xyz"])
     display_enu, display_window, display_cep, display_scale, display_outliers = static_calibrate_and_smooth(raw_enu)
@@ -1281,6 +1374,7 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
         header.approx_xyz,
         use_smoothed=True,
         elevation_mask_deg=args.elevation_mask,
+        iono_params=iono_params,
     )
     smoothed_enu_raw = to_enu_series(header.approx_xyz, smoothed_positions["xyz"])
     smoothed_enu, smoothed_window, smoothed_cep, smoothed_scale, smoothed_outliers = static_calibrate_and_smooth(
@@ -1306,11 +1400,7 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
         "prefix": prefix,
         "observation_epochs": len(epochs),
         "reference_xyz_m": [float(value) for value in header.approx_xyz],
-        "iono_parameters": {
-            "alpha": list(IONO_ALPHA_ZERO),
-            "beta": list(IONO_BETA_ZERO),
-            "source": "all-zero fallback because local RINEX nav headers do not contain ionospheric parameters",
-        },
+        "iono_parameters": ionosphere_metrics(iono_params, bds_sv),
         "selected_gps_satellite": gps_sv,
         "selected_bds_satellite": bds_sv,
         "selected_iono_satellite": iono_sv,
