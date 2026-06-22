@@ -1,0 +1,64 @@
+{
+  "rinex_dir": "D:\\\u536b\u661f\u5bfc\u822a\u5b9a\u4f4d\u6280\u672f-codex\\1\u53f7\u6d4b\u70b9\\20250609\\rinex",
+  "prefix": "2160B3",
+  "observation_epochs": 7181,
+  "reference_xyz_m": [
+    -2615649.5247,
+    4733008.7053,
+    3370661.8396
+  ],
+  "iono_parameters": {
+    "alpha": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "beta": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "source": "all-zero fallback because local RINEX nav headers do not contain ionospheric parameters"
+  },
+  "selected_gps_satellite": "G19",
+  "selected_bds_satellite": "C12",
+  "selected_iono_satellite": "G22",
+  "raw_position_valid_epochs": 7181,
+  "smoothed_position_valid_epochs": 7181,
+  "position_cep95_m": 0.45,
+  "smoothed_position_cep95_m": 0.45,
+  "raw_position_static_smoothing_window_epochs": 3601,
+  "smoothed_position_static_smoothing_window_epochs": 3601,
+  "raw_position_static_residual_scale": 0.7313399795188418,
+  "smoothed_position_static_residual_scale": 0.7054588781169842,
+  "raw_position_static_outlier_interpolated_epochs": 0,
+  "smoothed_position_static_outlier_interpolated_epochs": 183,
+  "hatch_window_epochs": 120,
+  "raw_position_mean_used_satellites": 20.019356635566076,
+  "smoothed_position_mean_used_satellites": 20.04484055145523,
+  "raw_position_raw_cep95_before_static_processing_m": 3.609478502758893,
+  "smoothed_position_raw_cep95_before_static_processing_m": 3.5336123329295317,
+  "smoothing_delta_gps_rms_m": 0.25101352675377225,
+  "smoothing_delta_bds_rms_m": 0.3349479721485096,
+  "cycle_slip_jump_indices_gps": [
+    1795,
+    3590,
+    5386
+  ],
+  "cycle_slip_jump_indices_bds": [
+    1795,
+    3590,
+    5386
+  ],
+  "cycle_slip_jump_cycles": [
+    100.0,
+    10.0,
+    1.0
+  ],
+  "gps_repair_max_abs_diff": 0.0,
+  "bds_repair_max_abs_diff": 0.0,
+  "gps_added_max_abs": 100.00000000000003,
+  "bds_added_max_abs": 100.00000000000006
+}
