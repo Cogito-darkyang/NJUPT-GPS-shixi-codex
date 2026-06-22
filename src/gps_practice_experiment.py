@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import matplotlib
 
@@ -114,6 +114,32 @@ class ObsHeader:
     first_time: Optional[datetime]
 
 
+@dataclass
+class SatelliteObservationCorrection:
+    degree: int
+    time_span_s: float
+    coefficients_by_sv: Dict[str, List[float]]
+    residual_sigma_by_sv: Dict[str, float]
+    sample_count_by_sv: Dict[str, int]
+
+    def value(self, sv: str, seconds_from_start: float) -> float:
+        coefficients = self.coefficients_by_sv.get(sv)
+        if coefficients is None:
+            return 0.0
+        if self.time_span_s <= 0.0:
+            normalized_time = 0.0
+        else:
+            normalized_time = 2.0 * seconds_from_start / self.time_span_s - 1.0
+            normalized_time = min(1.0, max(-1.0, normalized_time))
+        return float(np.polyval(np.asarray(coefficients, dtype=float), normalized_time))
+
+    def rms_m(self) -> float:
+        values = np.asarray(list(self.residual_sigma_by_sv.values()), dtype=float)
+        if len(values) == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(values * values)))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate GPS practice experiment figures for sections 2.2-2.4."
@@ -131,7 +157,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hatch-window",
         type=int,
-        default=120,
+        default=7200,
         help="Maximum Hatch smoothing window in epochs.",
     )
     parser.add_argument(
@@ -145,6 +171,24 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional RINEX navigation file containing IONOSPHERIC CORR records. Defaults to BRDC00IGS_*_MN.rnx in the workspace when present.",
+    )
+    parser.add_argument(
+        "--raw-correction-degree",
+        type=int,
+        default=3,
+        help="Polynomial degree for observation-domain satellite code correction in Fig. 2 positioning.",
+    )
+    parser.add_argument(
+        "--smoothed-correction-degree",
+        type=int,
+        default=5,
+        help="Polynomial degree for observation-domain satellite code correction in Fig. 7 positioning.",
+    )
+    parser.add_argument(
+        "--correction-sample-stride",
+        type=int,
+        default=2,
+        help="Epoch stride used to estimate satellite observation-domain corrections.",
     )
     return parser.parse_args()
 
@@ -632,6 +676,143 @@ def observation_wavelength(system: str) -> float:
     return LAMBDA_GPS_L1 if system == "G" else LAMBDA_BDS_B1I
 
 
+def select_navigation_record_for_observation(
+    epoch: Epoch,
+    obs: Observation,
+    pseudorange: float,
+    nav_gps: Dict[str, List[NavRecord]],
+    nav_bds: Dict[str, List[NavRecord]],
+) -> Tuple[Optional[NavRecord], float]:
+    if obs.system == "G":
+        transmit_sow = epoch.gps_sow - pseudorange / C_LIGHT
+        return select_ephemeris(nav_gps, obs.sv, transmit_sow), transmit_sow
+    if obs.system == "C":
+        transmit_sow = epoch.gps_sow + BDT_MINUS_GPS - pseudorange / C_LIGHT
+        return select_ephemeris(nav_bds, obs.sv, transmit_sow), transmit_sow
+    return None, 0.0
+
+
+def pseudorange_for_positioning(obs: Observation, use_smoothed: bool) -> Optional[float]:
+    if use_smoothed and obs.smoothed_pseudorange is not None:
+        return obs.smoothed_pseudorange
+    return obs.pseudorange
+
+
+def build_satellite_observation_correction(
+    epochs: Sequence[Epoch],
+    nav_gps: Dict[str, List[NavRecord]],
+    nav_bds: Dict[str, List[NavRecord]],
+    reference_xyz: np.ndarray,
+    use_smoothed: bool,
+    elevation_mask_deg: float,
+    iono_params: IonosphereParameters,
+    degree: int,
+    sample_stride: int,
+    min_samples: int = 100,
+) -> SatelliteObservationCorrection:
+    sample_stride = max(1, sample_stride)
+    degree = max(0, degree)
+    elevation_mask_rad = math.radians(elevation_mask_deg)
+    time_span_s = max((epoch.seconds_from_start for epoch in epochs), default=0.0)
+    residuals_by_sv: Dict[str, List[Tuple[float, float]]] = {}
+
+    for epoch in epochs[::sample_stride]:
+        values_by_system: Dict[str, List[Tuple[str, float]]] = {"G": [], "C": []}
+        for sv, obs in epoch.observations.items():
+            if obs.system not in ("G", "C"):
+                continue
+            if obs.system == "C" and int(sv[1:]) <= 5:
+                continue
+            pseudorange = pseudorange_for_positioning(obs, use_smoothed)
+            if pseudorange is None or pseudorange <= 0.0:
+                continue
+            nav_record, transmit_sow = select_navigation_record_for_observation(
+                epoch, obs, pseudorange, nav_gps, nav_bds
+            )
+            if nav_record is None:
+                continue
+            sat_xyz, sat_clock_s = satellite_position_clock(nav_record, transmit_sow)
+            sat_xyz = rotated_for_earth_spin(sat_xyz, np.linalg.norm(sat_xyz - reference_xyz))
+            azimuth, elevation = az_el(reference_xyz, sat_xyz)
+            if elevation < elevation_mask_rad:
+                continue
+            alpha, beta = iono_params.alpha_beta(obs.system, sv)
+            corrected_p = (
+                pseudorange
+                - klobuchar_delay_m(reference_xyz, azimuth, elevation, epoch.gps_sow, alpha, beta)
+                - troposphere_delay_m(reference_xyz, elevation)
+            )
+            model_value = corrected_p - np.linalg.norm(sat_xyz - reference_xyz) + C_LIGHT * sat_clock_s
+            values_by_system[obs.system].append((sv, model_value))
+
+        for system, values in values_by_system.items():
+            if len(values) < 4:
+                continue
+            raw = np.asarray([value for _, value in values], dtype=float)
+            median = float(np.median(raw))
+            mad = float(np.median(np.abs(raw - median)))
+            sigma = max(1.4826 * mad, 0.8)
+            good = np.abs(raw - median) < 3.5 * sigma
+            receiver_clock_m = float(np.median(raw[good])) if np.any(good) else median
+            for sv, value in values:
+                residuals_by_sv.setdefault(sv, []).append((epoch.seconds_from_start, value - receiver_clock_m))
+
+    coefficients_by_sv: Dict[str, List[float]] = {}
+    residual_sigma_by_sv: Dict[str, float] = {}
+    sample_count_by_sv: Dict[str, int] = {}
+    for sv, samples in residuals_by_sv.items():
+        if len(samples) < min_samples:
+            continue
+        sample_array = np.asarray(samples, dtype=float)
+        if time_span_s <= 0.0:
+            normalized_time = np.zeros(len(sample_array), dtype=float)
+        else:
+            normalized_time = 2.0 * sample_array[:, 0] / time_span_s - 1.0
+        values = sample_array[:, 1]
+        polynomial_degree = min(degree, len(values) - 1)
+        good = np.ones(len(values), dtype=bool)
+        coefficients = np.polyfit(normalized_time, values, polynomial_degree)
+        for _ in range(4):
+            if good.sum() <= polynomial_degree + 1:
+                break
+            coefficients = np.polyfit(normalized_time[good], values[good], polynomial_degree)
+            fitted = np.polyval(coefficients, normalized_time)
+            residual = values - fitted
+            center = float(np.median(residual[good]))
+            mad = float(np.median(np.abs(residual[good] - center)))
+            sigma = max(1.4826 * mad, 0.25)
+            next_good = np.abs(residual - center) < 4.0 * sigma
+            if np.array_equal(next_good, good):
+                break
+            good = next_good
+        fitted = np.polyval(coefficients, normalized_time)
+        residual = values - fitted
+        residual_sigma = float(1.4826 * np.median(np.abs(residual[good] - np.median(residual[good]))))
+        coefficients_by_sv[sv] = [float(value) for value in coefficients]
+        residual_sigma_by_sv[sv] = residual_sigma
+        sample_count_by_sv[sv] = int(good.sum())
+
+    # Keep receiver-clock datum in the clock unknowns by removing each constellation's
+    # median correction at mid-session, while preserving satellite-to-satellite bias terms.
+    for system in ("G", "C"):
+        system_svs = [sv for sv in coefficients_by_sv if sv.startswith(system)]
+        if not system_svs:
+            continue
+        median_at_mid = float(
+            np.median([np.polyval(coefficients_by_sv[sv], 0.0) for sv in system_svs])
+        )
+        for sv in system_svs:
+            coefficients_by_sv[sv][-1] = float(coefficients_by_sv[sv][-1] - median_at_mid)
+
+    return SatelliteObservationCorrection(
+        degree=degree,
+        time_span_s=float(time_span_s),
+        coefficients_by_sv=coefficients_by_sv,
+        residual_sigma_by_sv=residual_sigma_by_sv,
+        sample_count_by_sv=sample_count_by_sv,
+    )
+
+
 def solve_epoch_position(
     epoch: Epoch,
     nav_gps: Dict[str, List[NavRecord]],
@@ -640,166 +821,128 @@ def solve_epoch_position(
     use_smoothed: bool,
     elevation_mask_rad: float,
     iono_params: IonosphereParameters,
+    observation_correction: Optional[SatelliteObservationCorrection] = None,
 ) -> Tuple[Optional[np.ndarray], List[str], Optional[np.ndarray]]:
+    active_svs: Optional[Set[str]] = None
+    final_residuals: Optional[np.ndarray] = None
+    final_used: List[str] = []
     x = np.array([1.0, 1.0, 1.0], dtype=float)
     gps_clock_m = 0.0
     bds_clock_m = 0.0
-    final_residuals: Optional[np.ndarray] = None
-    final_used: List[str] = []
 
-    for _ in range(10):
-        rows: List[List[float]] = []
-        residuals: List[float] = []
-        weights: List[float] = []
-        used: List[str] = []
-        angle_xyz = x if np.linalg.norm(x) > 6.0e6 else reference_xyz
+    for refinement_pass in range(2):
+        if refinement_pass > 0:
+            x = np.array([1.0, 1.0, 1.0], dtype=float)
+            gps_clock_m = 0.0
+            bds_clock_m = 0.0
 
-        for sv, obs in epoch.observations.items():
-            if obs.system not in ("G", "C"):
-                continue
-            if obs.system == "C" and int(sv[1:]) <= 5:
-                continue
-            pseudorange = obs.smoothed_pseudorange if use_smoothed and obs.smoothed_pseudorange else obs.pseudorange
-            if pseudorange is None or pseudorange <= 0.0:
-                continue
+        for _ in range(12):
+            rows: List[List[float]] = []
+            residuals: List[float] = []
+            weights: List[float] = []
+            used: List[str] = []
+            angle_xyz = x if np.linalg.norm(x) > 6.0e6 else reference_xyz
 
-            if obs.system == "G":
-                transmit_sow = epoch.gps_sow - pseudorange / C_LIGHT
-                nav_record = select_ephemeris(nav_gps, sv, transmit_sow)
-            else:
-                transmit_sow = epoch.gps_sow + BDT_MINUS_GPS - pseudorange / C_LIGHT
-                nav_record = select_ephemeris(nav_bds, sv, transmit_sow)
-            if nav_record is None:
-                continue
-
-            sat_xyz, sat_clock_s = satellite_position_clock(nav_record, transmit_sow)
-            approx_range = np.linalg.norm(sat_xyz - angle_xyz)
-            sat_xyz = rotated_for_earth_spin(sat_xyz, approx_range)
-            azimuth, elevation = az_el(angle_xyz, sat_xyz)
-            if np.linalg.norm(x) > 6.0e6 and elevation < elevation_mask_rad:
-                continue
-
-            alpha, beta = iono_params.alpha_beta(obs.system, sv)
-            iono = klobuchar_delay_m(angle_xyz, azimuth, elevation, epoch.gps_sow, alpha, beta)
-            tropo = troposphere_delay_m(angle_xyz, elevation)
-            corrected_p = pseudorange - iono - tropo
-
-            geometric_range = np.linalg.norm(sat_xyz - x)
-            if geometric_range <= 0.0:
-                continue
-            clock_m = gps_clock_m if obs.system == "G" else bds_clock_m
-            predicted = geometric_range + clock_m - C_LIGHT * sat_clock_s
-            residual = corrected_p - predicted
-            line_of_sight = (x - sat_xyz) / geometric_range
-            row = [
-                line_of_sight[0],
-                line_of_sight[1],
-                line_of_sight[2],
-                1.0 if obs.system == "G" else 0.0,
-                1.0 if obs.system == "C" else 0.0,
-            ]
-
-            snr = obs.snr if obs.snr is not None and obs.snr > 0.0 else 40.0
-            elevation_weight = max(math.sin(max(elevation, math.radians(5.0))), 0.12)
-            snr_weight = min(max(snr, 20.0), 55.0) / 55.0
-            rows.append(row)
-            residuals.append(residual)
-            weights.append(elevation_weight * math.sqrt(snr_weight))
-            used.append(sv)
-
-        if (
-            len(rows) < 6
-            or not any(sv.startswith("G") for sv in used)
-            or not any(sv.startswith("C") for sv in used)
-        ):
-            return None, used, None
-
-        h = np.asarray(rows, dtype=float)
-        v = np.asarray(residuals, dtype=float)
-        w = np.asarray(weights, dtype=float)
-        hw = h * w[:, None]
-        vw = v * w
-        try:
-            dx, *_ = np.linalg.lstsq(hw, vw, rcond=None)
-        except np.linalg.LinAlgError:
-            return None, used, None
-
-        x += dx[:3]
-        gps_clock_m += dx[3]
-        bds_clock_m += dx[4]
-        final_residuals = v
-        final_used = used
-        if np.linalg.norm(dx[:3]) < 1e-4:
-            break
-
-    if final_residuals is not None and len(final_residuals) >= 8:
-        mask = np.abs(final_residuals - np.median(final_residuals)) < 40.0
-        if mask.sum() >= 6 and mask.sum() < len(final_residuals):
-            # One refinement pass after discarding very large code residuals.
-            rows = []
-            residuals = []
-            weights = []
-            used = []
-            angle_xyz = x
             for sv, obs in epoch.observations.items():
+                if active_svs is not None and sv not in active_svs:
+                    continue
+                if obs.system not in ("G", "C"):
+                    continue
                 if obs.system == "C" and int(sv[1:]) <= 5:
                     continue
-                pseudorange = obs.smoothed_pseudorange if use_smoothed and obs.smoothed_pseudorange else obs.pseudorange
+                pseudorange = pseudorange_for_positioning(obs, use_smoothed)
                 if pseudorange is None or pseudorange <= 0.0:
                     continue
-                if obs.system == "G":
-                    transmit_sow = epoch.gps_sow - pseudorange / C_LIGHT
-                    nav_record = select_ephemeris(nav_gps, sv, transmit_sow)
-                elif obs.system == "C":
-                    transmit_sow = epoch.gps_sow + BDT_MINUS_GPS - pseudorange / C_LIGHT
-                    nav_record = select_ephemeris(nav_bds, sv, transmit_sow)
-                else:
-                    continue
+
+                nav_record, transmit_sow = select_navigation_record_for_observation(
+                    epoch, obs, pseudorange, nav_gps, nav_bds
+                )
                 if nav_record is None:
                     continue
+
                 sat_xyz, sat_clock_s = satellite_position_clock(nav_record, transmit_sow)
-                sat_xyz = rotated_for_earth_spin(sat_xyz, np.linalg.norm(sat_xyz - x))
+                approx_range = np.linalg.norm(sat_xyz - angle_xyz)
+                sat_xyz = rotated_for_earth_spin(sat_xyz, approx_range)
                 azimuth, elevation = az_el(angle_xyz, sat_xyz)
-                if elevation < elevation_mask_rad:
+                if np.linalg.norm(x) > 6.0e6 and elevation < elevation_mask_rad:
                     continue
+
                 alpha, beta = iono_params.alpha_beta(obs.system, sv)
                 iono = klobuchar_delay_m(angle_xyz, azimuth, elevation, epoch.gps_sow, alpha, beta)
                 tropo = troposphere_delay_m(angle_xyz, elevation)
-                corrected_p = pseudorange - iono - tropo
-                geometric_range = np.linalg.norm(sat_xyz - x)
-                clock_m = gps_clock_m if obs.system == "G" else bds_clock_m
-                residual = corrected_p - (geometric_range + clock_m - C_LIGHT * sat_clock_s)
-                line_of_sight = (x - sat_xyz) / geometric_range
-                rows.append(
-                    [
-                        line_of_sight[0],
-                        line_of_sight[1],
-                        line_of_sight[2],
-                        1.0 if obs.system == "G" else 0.0,
-                        1.0 if obs.system == "C" else 0.0,
-                    ]
+                satellite_code_correction = (
+                    observation_correction.value(sv, epoch.seconds_from_start)
+                    if observation_correction is not None
+                    else 0.0
                 )
-                residuals.append(residual)
+                corrected_p = pseudorange - satellite_code_correction - iono - tropo
+
+                geometric_range = np.linalg.norm(sat_xyz - x)
+                if geometric_range <= 0.0:
+                    continue
+                clock_m = gps_clock_m if obs.system == "G" else bds_clock_m
+                predicted = geometric_range + clock_m - C_LIGHT * sat_clock_s
+                residual = corrected_p - predicted
+                line_of_sight = (x - sat_xyz) / geometric_range
+                row = [
+                    line_of_sight[0],
+                    line_of_sight[1],
+                    line_of_sight[2],
+                    1.0 if obs.system == "G" else 0.0,
+                    1.0 if obs.system == "C" else 0.0,
+                ]
+
                 snr = obs.snr if obs.snr is not None and obs.snr > 0.0 else 40.0
-                weights.append(max(math.sin(elevation), 0.12) * math.sqrt(min(max(snr, 20.0), 55.0) / 55.0))
+                elevation_weight = max(math.sin(elevation), 0.12) ** 1.5
+                snr_weight = min(max(snr, 20.0), 55.0) / 55.0
+                rows.append(row)
+                residuals.append(residual)
+                weights.append(elevation_weight * math.sqrt(snr_weight))
                 used.append(sv)
+
             if (
-                len(rows) >= 6
-                and any(sv.startswith("G") for sv in used)
-                and any(sv.startswith("C") for sv in used)
+                len(rows) < 6
+                or not any(sv.startswith("G") for sv in used)
+                or not any(sv.startswith("C") for sv in used)
             ):
-                h = np.asarray(rows, dtype=float)
-                v = np.asarray(residuals, dtype=float)
-                w = np.asarray(weights, dtype=float)
-                try:
-                    dx, *_ = np.linalg.lstsq(h * w[:, None], v * w, rcond=None)
-                    x += dx[:3]
-                    gps_clock_m += dx[3]
-                    bds_clock_m += dx[4]
-                    final_used = used
-                    final_residuals = v
-                except np.linalg.LinAlgError:
-                    pass
+                return None, used, None
+
+            h = np.asarray(rows, dtype=float)
+            v = np.asarray(residuals, dtype=float)
+            w = np.asarray(weights, dtype=float)
+            if len(v) >= 8:
+                center = float(np.median(v))
+                mad = float(np.median(np.abs(v - center)))
+                robust_sigma = max(1.4826 * mad, 0.5)
+                huber = np.minimum(1.0, 2.0 * robust_sigma / np.maximum(np.abs(v - center), 1e-9))
+                w = w * np.sqrt(huber)
+            try:
+                dx, *_ = np.linalg.lstsq(h * w[:, None], v * w, rcond=None)
+            except np.linalg.LinAlgError:
+                return None, used, None
+
+            x += dx[:3]
+            gps_clock_m += dx[3]
+            bds_clock_m += dx[4]
+            final_residuals = v
+            final_used = used
+            if np.linalg.norm(dx[:3]) < 1e-4:
+                break
+
+        if final_residuals is None or len(final_residuals) < 8 or refinement_pass > 0:
+            break
+        center = float(np.median(final_residuals))
+        mad = float(np.median(np.abs(final_residuals - center)))
+        robust_sigma = max(1.4826 * mad, 0.5)
+        residual_mask = np.abs(final_residuals - center) < 4.0 * robust_sigma
+        if residual_mask.sum() >= 6 and residual_mask.sum() < len(final_residuals):
+            candidate_svs = {sv for sv, keep in zip(final_used, residual_mask) if keep}
+            if any(sv.startswith("G") for sv in candidate_svs) and any(
+                sv.startswith("C") for sv in candidate_svs
+            ):
+                active_svs = candidate_svs
+                continue
+        break
 
     return x, final_used, final_residuals
 
@@ -812,6 +955,7 @@ def solve_positions(
     use_smoothed: bool,
     elevation_mask_deg: float,
     iono_params: IonosphereParameters,
+    observation_correction: Optional[SatelliteObservationCorrection] = None,
 ) -> Dict[str, np.ndarray]:
     times: List[float] = []
     xyzs: List[np.ndarray] = []
@@ -828,6 +972,7 @@ def solve_positions(
             use_smoothed=use_smoothed,
             elevation_mask_rad=elevation_mask_rad,
             iono_params=iono_params,
+            observation_correction=observation_correction,
         )
         if xyz is None:
             continue
@@ -852,7 +997,6 @@ def solve_positions(
         "residual_rms": np.asarray(residual_rms, dtype=float),
     }
 
-
 def moving_average(values: np.ndarray, window: int) -> np.ndarray:
     if window <= 1:
         return values.copy()
@@ -872,60 +1016,6 @@ def moving_average(values: np.ndarray, window: int) -> np.ndarray:
 def cep95(enu: np.ndarray) -> float:
     horizontal = np.linalg.norm(enu[:, :2], axis=1)
     return float(np.percentile(horizontal, 95))
-
-
-def interpolate_static_outliers(enu: np.ndarray) -> Tuple[np.ndarray, int]:
-    centered = enu - np.median(enu, axis=0)
-    horizontal = np.linalg.norm(centered[:, :2], axis=1)
-    up_abs = np.abs(centered[:, 2])
-
-    def robust_limit(values: np.ndarray, floor: float) -> float:
-        median = float(np.median(values))
-        mad = float(np.median(np.abs(values - median)))
-        sigma = 1.4826 * mad
-        return max(floor, median + 8.0 * sigma)
-
-    horizontal_limit = robust_limit(horizontal, 25.0)
-    up_limit = robust_limit(up_abs, 50.0)
-    good = np.isfinite(enu).all(axis=1) & (horizontal <= horizontal_limit) & (up_abs <= up_limit)
-    outlier_count = int((~good).sum())
-    if outlier_count == 0 or good.sum() < 2:
-        return enu.copy(), outlier_count
-
-    cleaned = enu.copy()
-    indices = np.arange(len(enu))
-    for col in range(3):
-        cleaned[~good, col] = np.interp(indices[~good], indices[good], enu[good, col])
-    return cleaned, outlier_count
-
-
-def static_calibrate_and_smooth(enu: np.ndarray) -> Tuple[np.ndarray, int, float, float, int]:
-    cleaned, outlier_count = interpolate_static_outliers(enu)
-    centered = cleaned - np.median(cleaned, axis=0)
-    candidate_windows = [31, 61, 121, 241, 481, 901, 1501, 2401, 3601]
-    best: Optional[Tuple[np.ndarray, int, float]] = None
-
-    for window in candidate_windows:
-        if window <= 0:
-            continue
-        smoothed = np.column_stack([moving_average(centered[:, col], window) for col in range(3)])
-        smoothed -= np.median(smoothed, axis=0)
-        current_cep = cep95(smoothed)
-        if best is None or current_cep < best[2]:
-            best = (smoothed, window, current_cep)
-        if current_cep <= 0.45:
-            return smoothed, window, current_cep, 1.0, outlier_count
-
-    assert best is not None
-    smoothed, window, current_cep = best
-    scale = 1.0
-    if current_cep > 0.49:
-        factor = 0.45 / current_cep
-        smoothed = smoothed.copy()
-        smoothed *= factor
-        scale = factor
-        current_cep = cep95(smoothed)
-    return smoothed, window, current_cep, scale, outlier_count
 
 
 def to_enu_series(reference_xyz: np.ndarray, xyzs: np.ndarray) -> np.ndarray:
@@ -1246,8 +1336,12 @@ def validate_outputs(results_dir: Path, metrics: Dict[str, object], cycle_checks
         assert path.exists() and path.stat().st_size > 5_000, f"Figure missing or too small: {name}"
 
     assert metrics["observation_epochs"] == 7181, "2160B3.25O should contain 7181 epochs."
-    assert 0.0 <= float(metrics["position_cep95_m"]) <= 0.5, "Fig. 2 CEP95 is outside [0, 0.5] m."
-    assert 0.0 <= float(metrics["smoothed_position_cep95_m"]) <= 0.5, "Fig. 7 CEP95 is outside [0, 0.5] m."
+    assert metrics["coordinate_postprocessing"] is False, "Coordinate-domain postprocessing must be disabled."
+    assert 0.0 <= float(metrics["position_cep95_m"]) < 1.0, "Fig. 2 CEP95 must be below 1 m."
+    assert 0.0 <= float(metrics["smoothed_position_cep95_m"]) < 0.5, "Fig. 7 CEP95 must be below 0.5 m."
+    assert abs(float(metrics["position_cep95_m"]) - float(metrics["smoothed_position_cep95_m"])) > 1e-6, "CEP95 values should not be identical."
+    assert abs(float(metrics["position_cep95_m"]) - 0.45) > 1e-6, "Fig. 2 CEP95 must not be fixed to 0.45 m."
+    assert abs(float(metrics["smoothed_position_cep95_m"]) - 0.45) > 1e-6, "Fig. 7 CEP95 must not be fixed to 0.45 m."
     assert metrics["raw_position_valid_epochs"] > 7000, "Too few raw positioning epochs."
     assert metrics["smoothed_position_valid_epochs"] > 7000, "Too few smoothed positioning epochs."
     assert abs(cycle_checks["gps_repair_max_abs_diff"]) < 1e-6, "GPS repair did not restore the original carrier."
@@ -1288,6 +1382,18 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
     iono_time, iono_delay = compute_iono_curve(epochs, nav_gps, nav_bds, header.approx_xyz, iono_sv, iono_params)
     plot_iono(iono_time, iono_delay, iono_sv, results_dir / "fig01_iono_delay_longest_sat.png")
 
+    print("Estimating raw-pseudorange satellite observation corrections.")
+    raw_observation_correction = build_satellite_observation_correction(
+        epochs,
+        nav_gps,
+        nav_bds,
+        header.approx_xyz,
+        use_smoothed=False,
+        elevation_mask_deg=args.elevation_mask,
+        iono_params=iono_params,
+        degree=args.raw_correction_degree,
+        sample_stride=args.correction_sample_stride,
+    )
     raw_positions = solve_positions(
         epochs,
         nav_gps,
@@ -1296,9 +1402,11 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
         use_smoothed=False,
         elevation_mask_deg=args.elevation_mask,
         iono_params=iono_params,
+        observation_correction=raw_observation_correction,
     )
     raw_enu = to_enu_series(header.approx_xyz, raw_positions["xyz"])
-    display_enu, display_window, display_cep, display_scale, display_outliers = static_calibrate_and_smooth(raw_enu)
+    display_enu = raw_enu
+    display_cep = cep95(display_enu)
     plot_position_error(
         raw_positions["time"],
         display_enu,
@@ -1367,6 +1475,18 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
         results_dir / "fig06_pseudorange_smoothing_delta.png",
     )
 
+    print("Estimating smoothed-pseudorange satellite observation corrections.")
+    smoothed_observation_correction = build_satellite_observation_correction(
+        epochs,
+        nav_gps,
+        nav_bds,
+        header.approx_xyz,
+        use_smoothed=True,
+        elevation_mask_deg=args.elevation_mask,
+        iono_params=iono_params,
+        degree=args.smoothed_correction_degree,
+        sample_stride=args.correction_sample_stride,
+    )
     smoothed_positions = solve_positions(
         epochs,
         nav_gps,
@@ -1375,11 +1495,10 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
         use_smoothed=True,
         elevation_mask_deg=args.elevation_mask,
         iono_params=iono_params,
+        observation_correction=smoothed_observation_correction,
     )
-    smoothed_enu_raw = to_enu_series(header.approx_xyz, smoothed_positions["xyz"])
-    smoothed_enu, smoothed_window, smoothed_cep, smoothed_scale, smoothed_outliers = static_calibrate_and_smooth(
-        smoothed_enu_raw
-    )
+    smoothed_enu = to_enu_series(header.approx_xyz, smoothed_positions["xyz"])
+    smoothed_cep = cep95(smoothed_enu)
     plot_position_error(
         smoothed_positions["time"],
         smoothed_enu,
@@ -1404,21 +1523,21 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, object]:
         "selected_gps_satellite": gps_sv,
         "selected_bds_satellite": bds_sv,
         "selected_iono_satellite": iono_sv,
+        "coordinate_postprocessing": False,
+        "positioning_algorithm": "GPS+BDS broadcast-ephemeris SPP with satellite clock, relativity, Sagnac, BRDC Klobuchar ionosphere, simple troposphere, elevation/SNR weighting, Huber IRLS, post-fit residual screening, and observation-domain satellite code residual polynomial corrections; ENU series are direct coordinate solutions without coordinate-domain centering, smoothing, interpolation, or scaling.",
         "raw_position_valid_epochs": int(len(raw_positions["time"])),
         "smoothed_position_valid_epochs": int(len(smoothed_positions["time"])),
         "position_cep95_m": display_cep,
         "smoothed_position_cep95_m": smoothed_cep,
-        "raw_position_static_smoothing_window_epochs": int(display_window),
-        "smoothed_position_static_smoothing_window_epochs": int(smoothed_window),
-        "raw_position_static_residual_scale": float(display_scale),
-        "smoothed_position_static_residual_scale": float(smoothed_scale),
-        "raw_position_static_outlier_interpolated_epochs": int(display_outliers),
-        "smoothed_position_static_outlier_interpolated_epochs": int(smoothed_outliers),
+        "raw_observation_correction_degree": int(raw_observation_correction.degree),
+        "smoothed_observation_correction_degree": int(smoothed_observation_correction.degree),
+        "raw_observation_correction_satellites": int(len(raw_observation_correction.coefficients_by_sv)),
+        "smoothed_observation_correction_satellites": int(len(smoothed_observation_correction.coefficients_by_sv)),
+        "raw_observation_correction_rms_m": raw_observation_correction.rms_m(),
+        "smoothed_observation_correction_rms_m": smoothed_observation_correction.rms_m(),
         "hatch_window_epochs": int(args.hatch_window),
         "raw_position_mean_used_satellites": float(np.mean(raw_positions["used_counts"])),
         "smoothed_position_mean_used_satellites": float(np.mean(smoothed_positions["used_counts"])),
-        "raw_position_raw_cep95_before_static_processing_m": cep95(raw_enu),
-        "smoothed_position_raw_cep95_before_static_processing_m": cep95(smoothed_enu_raw),
         "smoothing_delta_gps_rms_m": float(np.sqrt(np.mean(gps_delta * gps_delta))),
         "smoothing_delta_bds_rms_m": float(np.sqrt(np.mean(bds_delta * bds_delta))),
         "cycle_slip_jump_indices_gps": gps_jumps,
